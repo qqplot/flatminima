@@ -1,0 +1,22 @@
+dft/
+math_evaluation/outputs
+verl/outputs
+verl/tensorboard_log
+verl/wandb
+verl/checkpoints
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+*.log
+
+verl/trainenv
+verl/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+verl/flashinfer_python-0.2.2.post1+cu124torch2.6-cp38-abi3-linux_x86_64.whl
+verl/data.py
+verl/data/
+verl/data2.py
+verl/aime_balanced_10_responses_per_problem.jsonl
+verl/verl.egg-info/
