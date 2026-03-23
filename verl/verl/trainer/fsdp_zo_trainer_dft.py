@@ -445,372 +445,136 @@ class FSDPSFTTrainer:
                 loss.backward()
             return loss
 
-    # def _apply_noise_in_place(self, alpha, local_seed, global_seed):
-    #     """In-place로 노이즈를 더해주고, 해당 시점의 Norm을 계산하여 반환합니다."""
-    #     dp_size = self.device_mesh.size(0)
-    #     local_norm_sq = 0.0
-
-    #     for name, param in self.fsdp_model.named_parameters():
-    #         if not param.requires_grad:
-    #             continue
-
-    #         # Sharded 여부 판별 (FSDP1 / FSDP2 혼용 대응)
-    #         is_sharded = True
-    #         if hasattr(param, "placements"): # FSDP2 (DTensor)
-    #             from torch.distributed._tensor.placement_types import Replicate
-    #             if all(isinstance(p, Replicate) for p in param.placements):
-    #                 is_sharded = False
-    #         elif "flat_param" not in name: # FSDP1 heuristic
-    #             is_sharded = False
-
-    #         seed_to_use = local_seed if is_sharded else global_seed
-
-    #         # 파라미터별 독립된 동일 난수 생성 보장
-    #         with torch.random.fork_rng(devices=[param.device]):
-    #             torch.manual_seed(seed_to_use)
-    #             z = torch.randn_like(param)
-
-    #         # 1. Norm 계산 로직 (Replicated 파라미터 중복 합산 방지)
-    #         z_local = z._local_tensor if hasattr(z, "_local_tensor") else z
-    #         norm_val = float(z_local.pow(2).sum().item())
-    #         if not is_sharded:
-    #             norm_val /= float(dp_size) # 차후 all_reduce(SUM)에서 정상 값으로 복구됨
-    #         local_norm_sq += norm_val
-
-    #         # 2. In-place 노이즈 적용
-    #         if hasattr(param, "_local_tensor") and hasattr(z, "_local_tensor"):
-    #             param._local_tensor.add_(z._local_tensor, alpha=alpha)
-    #         else:
-    #             param.data.add_(z, alpha=alpha)
-                
-    #     return local_norm_sq
-
-
-    # def training_step(self, batch: TensorDict, step: int = 0):
-    #     self.fsdp_model.train()
-
-    #     log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
-    #     self.optimizer.zero_grad()
-    #     log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
-
-    #     micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
-    #     n_micro_batches = len(micro_batches)
-
-    #     zo_sigma = self.config.optim.get("zo_sigma", 1e-3)
-    #     sam_rho = self.config.optim.get("sam_rho", 0.0005)
-
-    #     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    #     # local_seed = step + rank * 100000 
-    #     global_seed = step 
-    #     local_seed = step + rank * 100000
-
-    #     # =================================================================
-    #     # 🛡️ [방어 1] PyTorch 공식 State Dict API를 통한 완벽한 상태 관리
-    #     # (FSDP가 파라미터 크기를 몰래 바꿔도 알아서 안전하게 매핑해 줍니다!)
-    #     # =================================================================
-    #     if self.config.model.strategy == "fsdp2":
-    #         from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
-    #         options = StateDictOptions(full_state_dict=False, cpu_offload=False)
-    #         orig_state = get_model_state_dict(self.fsdp_model, options=options)
-    #         orig_state = {k: v.clone() for k, v in orig_state.items()}
-            
-    #         def apply_state(state):
-    #             set_model_state_dict(self.fsdp_model, state, options=options)
-    #     else:
-    #         from torch.distributed.fsdp import StateDictType
-    #         with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
-    #             orig_state = {k: v.clone() for k, v in self.fsdp_model.state_dict().items()}
-                
-    #         def apply_state(state):
-    #             with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
-    #                 self.fsdp_model.load_state_dict(state, strict=False)
-
-    #     # 업데이트가 필요한(requires_grad) 파라미터 이름만 추출
-    #     grad_keys = {k for k, p in self.fsdp_model.named_parameters() if p.requires_grad}
-
-    #     def apply_noise(alpha, current_local_seed):
-    #         noisy_state = {}
-    #         for k, v in orig_state.items():
-    #             if k in grad_keys:
-    #                 # 파라미터가 샤딩되었는지 확인 (DTensor의 경우 placements 검사)
-    #                 is_sharded = True
-    #                 if hasattr(v, "placements"): # FSDP2 (DTensor)
-    #                     # Replicate 상태인지 Shard 상태인지 확인
-    #                     from torch.distributed._tensor.placement_types import Replicate
-    #                     if all(isinstance(p, Replicate) for p in v.placements):
-    #                         is_sharded = False
-    #                 elif getattr(v, "numel", lambda: 0)() == getattr(self.model.get_parameter(k), "numel", lambda: -1)():
-    #                     # FSDP1 대략적 추론: 텐서 크기가 원본과 같으면 복제된 것 (예: LayerNorm)
-    #                     is_sharded = False
-                    
-    #                 # 복제된 파라미터는 노드 간 값이 완전히 일치해야 하므로 global_seed 사용
-    #                 seed_to_use = current_local_seed if is_sharded else global_seed
-                    
-    #                 # 🛠️ torch.random.fork_rng로 안전한 난수 제어
-    #                 with torch.random.fork_rng(devices=[v.device]):
-    #                     torch.manual_seed(seed_to_use)
-    #                     z = torch.randn_like(v)
-                    
-    #                 noisy_v = v.clone()
-                    
-    #                 # 🛠️ [버그 4 수정] DTensor의 경우 In-place 연산 충돌을 피하기 위해 로컬 텐서에 직접 연산
-    #                 if hasattr(noisy_v, "_local_tensor") and hasattr(z, "_local_tensor"):
-    #                     noisy_v._local_tensor.add_(z._local_tensor, alpha=alpha)
-    #                 else:
-    #                     noisy_v.add_(z, alpha=alpha)
-                        
-    #                 noisy_state[k] = noisy_v
-    #             else:
-    #                 noisy_state[k] = v.clone()
-            
-    #         apply_state(noisy_state)
-
-
-    #     # =================================================================
-    #     # [AdaZo-SAM 단계 1] ZO 탐색 (eval 모드)
-    #     # =================================================================
-    #     self.fsdp_model.eval()
-
-    #     with torch.no_grad():
-    #         # 1. +Z 방향 탐색
-    #         apply_noise(zo_sigma, local_seed)
-    #         loss1_local = sum(
-    #             self._compute_loss_and_backward(mb, do_backward=False).item() / n_micro_batches 
-    #             for mb in micro_batches
-    #         )
-            
-    #         # 2. -Z 방향 탐색
-    #         apply_noise(-zo_sigma, local_seed)
-    #         loss2_local = sum(
-    #             self._compute_loss_and_backward(mb, do_backward=False).item() / n_micro_batches 
-    #             for mb in micro_batches
-    #         )
-
-    #     # Loss 통신 및 방향 추정
-    #     loss_tensor = torch.tensor([loss1_local, loss2_local], device=self.device_name)
-    #     if torch.distributed.is_initialized():
-    #         torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.AVG)
-    #     global_loss1, global_loss2 = loss_tensor[0].item(), loss_tensor[1].item()
-
-    #     g_proj = (global_loss1 - global_loss2) / (2 * zo_sigma)
-
-    #     # Norm Z 계산 (State Dict 기반으로 일관성 100% 보장)
-    #     local_norm_sq = 0.0
-    #     torch.manual_seed(local_seed)
-    #     for k, v in orig_state.items():
-    #         if k in grad_keys:
-    #             z = torch.randn_like(v)
-    #             z_local = z.to_local() if hasattr(z, "to_local") else z
-    #             local_norm_sq += float(z_local.pow(2).sum().item())
-                
-    #     norm_tensor = torch.tensor([local_norm_sq], device=self.device_name)
-    #     if torch.distributed.is_initialized():
-    #         torch.distributed.all_reduce(norm_tensor, op=torch.distributed.ReduceOp.SUM)
-    #     norm_z = (norm_tensor[0].item() + 1e-12) ** 0.5
-        
-    #     # 최악의 위치 방향 결정
-    #     eps_scale = sam_rho * torch.sign(torch.tensor(g_proj)).item() / norm_z
-
-    #     # =================================================================
-    #     # [AdaZo-SAM 단계 2] 최악의 위치 세팅 후 훈련 모드 재개
-    #     # =================================================================
-
-    #     # apply_noise 호출 직전에 추가
-    #     # before_norm = sum(p.sum().item() for p in self.fsdp_model.parameters() if p.requires_grad)
-
-    #     # apply_noise(zo_sigma, local_seed) # 노이즈 주입!
-    #     apply_noise(eps_scale, local_seed) # 노이즈 주입!
-
-    #     # after_norm = sum(p.sum().item() for p in self.fsdp_model.parameters() if p.requires_grad)
-    #     # if rank == 0:
-    #     #     print(f"가중치 변화 확인 - Before: {before_norm:.4f}, After: {after_norm:.4f}")
-
-    #     self.fsdp_model.train()
-
-    #     # 실제 Backward Pass 1회 수행
-    #     step_loss = 0
-    #     for micro_batch in micro_batches:
-    #         loss = self._compute_loss_and_backward(batch=micro_batch, do_backward=True) / n_micro_batches
-    #         step_loss += loss.item()
-
-    #     if self.config.model.strategy == "fsdp":
-    #         grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
-    #     elif self.config.model.strategy == "fsdp2":
-    #         grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
-    #     else:
-    #         raise NotImplementedError(f"not implement {self.config.model.strategy}")
-
-    #     # =================================================================
-    #     # 🛡️ [방어 3] 옵티마이저 스텝 직전, 가중치를 '안전하게' 원본 완벽 복원
-    #     # =================================================================
-    #     apply_state(orig_state)
-
-    #     # --- 옵티마이저 업데이트 ---
-    #     log_gpu_memory_usage("Before optimizer step", logger=logger)
-
-    #     if not torch.isfinite(grad_norm):
-    #         print(f"WARN: grad_norm is not finite: {grad_norm}")
-    #         self.optimizer.zero_grad()
-    #     else:
-    #         self.optimizer.step()
-
-    #     log_gpu_memory_usage("After optimizer step", logger=logger)
-    #     self.lr_scheduler.step()
-
-    #     lr = self.lr_scheduler.get_last_lr()[0]
-    #     step_loss = torch.tensor(step_loss).to(self.device_name)
-        
-    #     if is_cuda_available:
-    #         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-    #     elif is_npu_available:
-    #         torch.distributed.all_reduce(step_loss)
-    #         step_loss /= self.device_mesh.size(0)
-            
-    #     # return {"train/loss": step_loss.detach().item(), "train/lr(1e-3)": lr * 1e3}
-    #     return {
-    #                 "train/loss": step_loss.detach().item(), 
-    #                 "train/lr(1e-3)": lr * 1e3,
-    #                 "sam/eps_scale": eps_scale,  # 실제 이동 스텝
-    #                 "sam/norm_z": norm_z,        # 노이즈 스케일
-    #                 "sam/g_proj": g_proj         # 방향성(기울기) 추정치
-    #             }        
-
     def training_step(self, batch: TensorDict, step: int = 0):
+        # =================================================================
+        # 순수 Zeroth-Order (ZO) Optimization (논문 Algorithm 1)
+        # =================================================================
         self.fsdp_model.train()
         self.optimizer.zero_grad()
+
+        # 논문의 smoothing parameter (lambda) [cite: 32]
+        zo_lambda = self.config.optim.get("zo_lambda", 1e-3)
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        global_seed = step
+        local_seed = step + rank * 100000
+
+        # --- 상태 백업 (원본 가중치 유지) ---
+        if self.config.model.strategy == "fsdp2":
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
+            options = StateDictOptions(full_state_dict=False, cpu_offload=False)
+            orig_state = get_model_state_dict(self.fsdp_model, options=options)
+            orig_state = {k: v.clone() for k, v in orig_state.items()}
+            
+            def apply_state(state):
+                set_model_state_dict(self.fsdp_model, state, options=options)
+        else:
+            from torch.distributed.fsdp import StateDictType
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
+                orig_state = {k: v.clone() for k, v in self.fsdp_model.state_dict().items()}
+                
+            def apply_state(state):
+                with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
+                    self.fsdp_model.load_state_dict(state, strict=False)
+
+        grad_keys = {k for k, p in self.fsdp_model.named_parameters() if p.requires_grad}
+
+        # --- 노이즈 주입 함수 ---
+        def apply_noise(alpha, current_local_seed):
+            noisy_state = {}
+            for k, v in orig_state.items():
+                if k in grad_keys:
+                    is_sharded = True
+                    if hasattr(v, "placements"):
+                        from torch.distributed._tensor.placement_types import Replicate
+                        if all(isinstance(p, Replicate) for p in v.placements):
+                            is_sharded = False
+                    elif getattr(v, "numel", lambda: 0)() == getattr(self.model.get_parameter(k), "numel", lambda: -1)():
+                        is_sharded = False
+                    
+                    seed_to_use = current_local_seed if is_sharded else global_seed
+                    with torch.random.fork_rng(devices=[v.device]):
+                        torch.manual_seed(seed_to_use)
+                        z = torch.randn_like(v)
+                    
+                    noisy_v = v.clone()
+                    if hasattr(noisy_v, "_local_tensor") and hasattr(z, "_local_tensor"):
+                        noisy_v._local_tensor.add_(z._local_tensor, alpha=alpha)
+                    else:
+                        noisy_v.add_(z, alpha=alpha)
+                    noisy_state[k] = noisy_v
+                else:
+                    noisy_state[k] = v.clone()
+            apply_state(noisy_state)
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
 
-        zo_sigma = self.config.optim.get("zo_sigma", 1e-3)
-        sam_rho = self.config.optim.get("sam_rho", 0.0005)
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        global_seed = step 
-        local_seed = step + rank * 100000
-
-        # 업데이트가 필요한 파라미터 키 추출
-        grad_keys = {k for k, p in self.fsdp_model.named_parameters() if p.requires_grad}
-
         # =================================================================
-        # 🛡️ [메모리 안전 백업] PyTorch 공식 State Dict API 활용 (질문자님 원본 구조)
+        # 🚀 ZO 핵심: Backprop 없이 Forward 두 번으로 기울기 추정!
         # =================================================================
-        is_fsdp2 = self.config.model.strategy == "fsdp2"
-        
-        if is_fsdp2:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
-            options = StateDictOptions(full_state_dict=False, cpu_offload=False)
-            raw_state = get_model_state_dict(self.fsdp_model, options=options)
-        else:
-            from torch.distributed.fsdp import StateDictType
-            with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
-                raw_state = self.fsdp_model.state_dict()
-                
-        # 로컬 Shard 파라미터 복사 (GPU당 약 700MB 수준이므로 OOM 걱정 없음)
-        orig_state = {k: v.clone() for k, v in raw_state.items()}
-        
-        def apply_state(state_dict):
-            """FSDP 내부 로직을 안전하게 통과하는 공식 상태 업데이트"""
-            if is_fsdp2:
-                set_model_state_dict(self.fsdp_model, state_dict, options=options)
-            else:
-                with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
-                    self.fsdp_model.load_state_dict(state_dict, strict=False)
-
-        dp_size = self.device_mesh.size(0)
-
-        def get_noisy_state_and_norm(alpha):
-            """Drift(표류) 없는 노이즈 상태 및 완벽한 Norm 계산"""
-            noisy_state = {}
-            local_norm_sq = 0.0
+        with torch.no_grad(): # 역전파 아예 안 씁니다. 메모리 대폭 절약!
+            # 1. f(x + λu) 계산 
+            apply_noise(zo_lambda, local_seed)
+            loss_plus_local = sum(
+                self._compute_loss_and_backward(mb, do_backward=False).item() / n_micro_batches 
+                for mb in micro_batches
+            )
             
-            for k, v in orig_state.items():
-                if k in grad_keys:
-                    is_sharded = True
-                    if hasattr(v, "placements"): # FSDP2
-                        from torch.distributed._tensor.placement_types import Replicate
-                        if all(isinstance(p, Replicate) for p in v.placements):
-                            is_sharded = False
-                    elif "flat_param" not in k: # FSDP1 휴리스틱
-                        is_sharded = False
+            # 2. f(x - λu) 계산 
+            apply_noise(-zo_lambda, local_seed)
+            loss_minus_local = sum(
+                self._compute_loss_and_backward(mb, do_backward=False).item() / n_micro_batches 
+                for mb in micro_batches
+            )
 
-                    seed_to_use = local_seed if is_sharded else global_seed
-
-                    with torch.random.fork_rng(devices=[v.device]):
-                        torch.manual_seed(seed_to_use)
-                        z = torch.randn_like(v)
-
-                    # Norm 계산 (Replicated 파라미터의 중복 합산 방지)
-                    z_local = z._local_tensor if hasattr(z, "_local_tensor") else z
-                    norm_val = float(z_local.pow(2).sum().item())
-                    if not is_sharded:
-                        norm_val /= float(dp_size)
-                    
-                    local_norm_sq += norm_val
-                    
-                    # In-place 덧셈(add_) 대신 수학적으로 깨끗한 독립 텐서 생성
-                    noisy_state[k] = v + z * alpha
-                else:
-                    noisy_state[k] = v.clone()
-
-            return noisy_state, local_norm_sq
-
-        # =================================================================
-        # [AdaZo-SAM 단계 1] ZO 탐색 (eval 모드)
-        # =================================================================
-        self.fsdp_model.eval()
-
-        with torch.no_grad():
-            # 1. +Z 방향
-            noisy_state_plus, local_norm_sq = get_noisy_state_and_norm(zo_sigma)
-            apply_state(noisy_state_plus)
-            loss1_local = sum(self._compute_loss_and_backward(mb, do_backward=False).item() / n_micro_batches for mb in micro_batches)
-            
-            # 2. -Z 방향
-            noisy_state_minus, _ = get_noisy_state_and_norm(-zo_sigma)
-            apply_state(noisy_state_minus)
-            loss2_local = sum(self._compute_loss_and_backward(mb, do_backward=False).item() / n_micro_batches for mb in micro_batches)
-
-        # Loss 통신 및 방향 추정
-        loss_tensor = torch.tensor([loss1_local, loss2_local], device=self.device_name)
+        # Loss 통신 (Global Loss 계산)
+        loss_tensor = torch.tensor([loss_plus_local, loss_minus_local], device=self.device_name)
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.AVG)
-        global_loss1, global_loss2 = loss_tensor[0].item(), loss_tensor[1].item()
-
-        g_proj = (global_loss1 - global_loss2) / (2 * zo_sigma)
-
-        norm_tensor = torch.tensor([local_norm_sq], device=self.device_name)
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(norm_tensor, op=torch.distributed.ReduceOp.SUM)
-        norm_z = (norm_tensor[0].item() + 1e-12) ** 0.5
         
-        eps_scale = sam_rho * torch.sign(torch.tensor(g_proj)).item() / norm_z
+        global_loss_plus, global_loss_minus = loss_tensor[0].item(), loss_tensor[1].item()
+
+        # 원본 상태 복원
+        apply_state(orig_state)
+
+        # 3. 그래디언트 스칼라 추정: (L_plus - L_minus) / (2 * lambda) 
+        projected_grad_scalar = (global_loss_plus - global_loss_minus) / (2 * zo_lambda)
 
         # =================================================================
-        # [AdaZo-SAM 단계 2] 최악의 위치 세팅 후 훈련 모드 재개
+        # 수동으로 p.grad 할당 (FSDP 통신 최소화)
         # =================================================================
-        noisy_state_eps, _ = get_noisy_state_and_norm(eps_scale)
-        apply_state(noisy_state_eps)
-        self.fsdp_model.train()
+        for k, p in self.fsdp_model.named_parameters():
+            if p.requires_grad:
+                v = orig_state[k]
+                is_sharded = True
+                if hasattr(v, "placements"):
+                    from torch.distributed._tensor.placement_types import Replicate
+                    if all(isinstance(p, Replicate) for p in v.placements):
+                        is_sharded = False
+                elif getattr(v, "numel", lambda: 0)() == getattr(self.model.get_parameter(k), "numel", lambda: -1)():
+                    is_sharded = False
 
-        # 실제 Backward Pass 수행
-        step_loss = 0
-        for i, micro_batch in enumerate(micro_batches):
-            is_last_microbatch = (i == len(micro_batches) - 1)
-            context = self.fsdp_model.no_sync() if not is_last_microbatch and hasattr(self.fsdp_model, "no_sync") else nullcontext()
-            with context:
-                loss = self._compute_loss_and_backward(batch=micro_batch, do_backward=True)
-                step_loss += (loss.item() / n_micro_batches)
+                # 위에서 썼던 것과 "정확히 동일한" 노이즈 z를 다시 생성
+                seed_to_use = local_seed if is_sharded else global_seed
+                with torch.random.fork_rng(devices=[v.device]):
+                    torch.manual_seed(seed_to_use)
+                    z = torch.randn_like(v)
+                
+                # p.grad = 스칼라 * z 
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+                
+                if hasattr(p.grad, "_local_tensor") and hasattr(z, "_local_tensor"):
+                    p.grad._local_tensor.copy_(z._local_tensor * projected_grad_scalar)
+                else:
+                    p.grad.copy_(z * projected_grad_scalar)
 
+        # --- 옵티마이저 업데이트 ---
         if self.config.model.strategy == "fsdp":
             grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
         elif self.config.model.strategy == "fsdp2":
             grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
-
-        # =================================================================
-        # 🛡️ 옵티마이저 스텝 직전, 가중치를 안전하게 원본 복원
-        # =================================================================
-        apply_state(orig_state)
 
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
@@ -820,20 +584,15 @@ class FSDPSFTTrainer:
 
         self.lr_scheduler.step()
         lr = self.lr_scheduler.get_last_lr()[0]
-        step_loss = torch.tensor(step_loss).to(self.device_name)
         
-        if is_cuda_available:
-            torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-        elif is_npu_available:
-            torch.distributed.all_reduce(step_loss)
-            step_loss /= self.device_mesh.size(0)
-            
+        # 대표 Loss값은 두 탐색의 평균으로 리포트
+        step_loss = (global_loss_plus + global_loss_minus) / 2.0
+
         return {
-            "train/loss": step_loss.detach().item(), 
+            "train/loss": step_loss, 
             "train/lr(1e-3)": lr * 1e3,
-            "sam/eps_scale": eps_scale,
-            "sam/norm_z": norm_z,
-            "sam/g_proj": g_proj
+            "zo/loss_diff": global_loss_plus - global_loss_minus,
+            "zo/grad_scalar": projected_grad_scalar
         }
 
     def validation_step(self, batch: TensorDict):
