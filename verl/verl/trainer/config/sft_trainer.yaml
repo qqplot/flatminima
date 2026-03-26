@@ -48,7 +48,9 @@ optim:
   clip_grad: 1.0
   lr_scheduler: cosine
   zo_sigma: 1e-3
-  sam_rho: 0.005
+  # sam_rho: 0.005
+  sam_rho_max: 20.0
+  sam_rho_min: 2.0
 
 ulysses_sequence_parallel_size: 1
 use_remove_padding: False

@@ -683,7 +683,26 @@ class FSDPSFTTrainer:
         n_micro_batches = len(micro_batches)
 
         zo_sigma = self.config.optim.get("zo_sigma", 1e-3)
-        sam_rho = self.config.optim.get("sam_rho", 0.0005)
+        # sam_rho = self.config.optim.get("sam_rho", 0.0005)
+        # =================================================================
+        # 🔥 GSAM 기반 sam_rho 동적 스케줄링 (bfloat16 안전장치 포함)
+        # =================================================================
+        current_lr = self.lr_scheduler.get_last_lr()[0]
+        lr_max = self.config.optim.lr
+        lr_min = 0.0
+        
+        # config에서 max, min 값을 받도록 수정 (기본값 세팅)
+        rho_max = self.config.optim.get("sam_rho_max", 20.0) 
+        rho_min = self.config.optim.get("sam_rho_min", 2.0)  
+        
+        if lr_max > lr_min:
+            sam_rho = rho_min + (rho_max - rho_min) * ((current_lr - lr_min) / (lr_max - lr_min))
+        else:
+            sam_rho = rho_max
+
+        sam_rho = max(rho_min, float(sam_rho))
+        # =================================================================
+
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         global_seed = step 
@@ -827,13 +846,19 @@ class FSDPSFTTrainer:
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.device_mesh.size(0)
-            
+
+        base_loss_approx = (global_loss1 + global_loss2) / 2.0
+        adv_loss = step_loss.detach().item()
+
         return {
             "train/loss": step_loss.detach().item(), 
             "train/lr(1e-3)": lr * 1e3,
             "sam/eps_scale": eps_scale,
+            "sam/sam_rho": sam_rho,            
             "sam/norm_z": norm_z,
-            "sam/g_proj": g_proj
+            "sam/g_proj": g_proj,
+            "sam/base_loss_approx": base_loss_approx, # 원래 위치의 평화로운(?) Loss
+            "sam/loss_diff": adv_loss - base_loss_approx # 얼마나 악화시켰는가! (클수록 SAM이 강하게 들어간 것)
         }
 
     def validation_step(self, batch: TensorDict):
