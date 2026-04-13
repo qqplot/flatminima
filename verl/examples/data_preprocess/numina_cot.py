@@ -76,7 +76,7 @@ if __name__ == '__main__':
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
     dataset = datasets.load_dataset(data_source, trust_remote_code=True)
 
-    dataset = dataset.filter(lambda x: x["source"] in ("synthetic_amc", "synthetic_math"))
+    # dataset = dataset.filter(lambda x: x["source"] in ("synthetic_amc", "synthetic_math"))
     dataset = dataset.select_columns(["source", "problem", "solution"])
 
     train_dataset = dataset['train']
@@ -123,7 +123,7 @@ if __name__ == '__main__':
     print(f"length of train_dataset: {len(train_dataset)}")
     local_dir = args.local_dir
 
-    train_dataset.to_parquet(os.path.join(local_dir, 'train_synonly.parquet'))
+    train_dataset.to_parquet(os.path.join(local_dir, 'train.parquet'))
     print(train_dataset[0])
 
 
