@@ -370,9 +370,15 @@ class FSDPSFTTrainer:
 
                 # 💡 [DFT 적용] config가 켜져있을 때만 정답 토큰 예측 확률을 곱해줌
                 if use_dft:
-                    probs = torch.softmax(shift_logits, dim=-1)
-                    prob_coefficients = probs.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
-                    loss = loss * prob_coefficients.detach()
+                    with torch.no_grad():
+                        target_logits = shift_logits.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
+                        log_sum_exp = torch.logsumexp(shift_logits, dim=-1)
+                        prob_coefficients = (target_logits - log_sum_exp).exp()
+                    loss = loss * prob_coefficients
+
+
+
+
 
                 loss = loss * loss_mask.to(loss.device)
             else:
