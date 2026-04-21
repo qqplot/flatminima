@@ -12,50 +12,124 @@
 #SBATCH --output=logs/numina-cot-sft-%j.out             # 표준 출력 로그 (logs 폴더 미리 생성 필요)
 #SBATCH --error=logs/numina-cot-sft-%j.err              # 에러 로그
 
-# 2. 환경 변수 설정 (에러 방지 및 최적화)
-export CUDA_VISIBLE_DEVICES=0,1          # Slurm이 알아서 할당하지만 명시적으로 지정 가능
-export NCCL_P2P_DISABLE=0                # Blackwell NVLink 성능 극대화 (P2P 허용)
-export NCCL_IB_DISABLE=1                 # 단일 노드인 경우 인피니밴드 무시
+# 2. 환경 변수 설정 (ROCm / RCCL)
+export NCCL_P2P_DISABLE=0                # RCCL은 NCCL_* 변수를 그대로 따름
+export NCCL_IB_DISABLE=1                 # 단일 노드
+# wandb: API 키 없을 때 학습이 죽지 않도록 기본을 offline으로. 로그인 돼 있으면 online으로 override 가능
+export WANDB_MODE=${WANDB_MODE:-online}
 
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate DFT
+# 시스템 rocm-torch Python 사용 (conda 불필요). 필요 시 PYBIN을 덮어쓰면 됨.
+PYBIN=${PYBIN:-$(command -v python)}
 
-nproc_per_node=2
+# 로그 파일 경로 (stdout/stderr 모두 티) — 실시간 tail 가능
+LOG_DIR=${LOG_DIR:-logs}
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/sft-$(date +%Y%m%d-%H%M%S).log}"
+echo "[train_sft] logging to $LOG_FILE"
+
+# 이 라인 이후 모든 stdout/stderr가 터미널과 로그 파일 양쪽으로 동시에 흐름
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "[train_sft] python = $PYBIN"
+$PYBIN -c "import torch; print('[train_sft] torch', torch.__version__, 'hip', torch.version.hip, 'devs', torch.cuda.device_count())"
+
+nproc_per_node=${NPROC_PER_NODE:-8}
 project_name=numina-cot
 
-model_name="Qwen/Qwen3-0.6B-Base"
-experiment_name="numina-cot-sft-qwen-3-base-0.6b"
-
+model_name="Qwen/Qwen2.5-Math-1.5B"
+experiment_name="numina-cot-sft-qwen-2.5-math-1.5b"
 
 save_path=checkpoints/$experiment_name
 lr=5e-5
 
-torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
-        -m verl.trainer.fsdp_sft_trainer \
-    data.train_files=data/numina_cot/train.parquet \
-    data.val_files=data/math500/test.parquet \
-    data.prompt_key=extra_info \
-    data.response_key=extra_info \
-    data.train_batch_size=256 \
-    data.max_length=4096 \
-    optim.lr=$lr \
-    data.prompt_dict_keys=['question'] \
-    data.response_dict_keys=['answer'] \
-    data.micro_batch_size_per_gpu=8 \
-    model.partial_pretrain=$model_name \
-    model.use_liger=True \
-    model.fsdp_config.model_dtype=bf16 \
-    trainer.default_local_dir=$save_path \
-    trainer.project_name=$project_name \
-    trainer.experiment_name="$experiment_name-$(date +%Y%m%d-%H%M%S)" \
-    trainer.logger=['console','wandb'] \
-    trainer.default_hdfs_dir=null \
-    trainer.test_freq=10 \
-    trainer.save_freq=50 \
-    trainer.total_epochs=1 \
-    trainer.n_gpus_per_node=$nproc_per_node \
-    ulysses_sequence_parallel_size=1 \
+# Chunked training 설정: 100 step 마다 종료하고 15분 sleep 후 resume 반복.
+chunk_steps=${CHUNK_STEPS:-100}          # 한 번에 학습할 step 수
+sleep_seconds=${SLEEP_SECONDS:-900}      # 15분
+run_timestamp=$(date +%Y%m%d-%H%M%S)     # phase 전체가 같은 experiment_name 공유
+
+# 두 phase 공통 인자 (단일 source of truth)
+common_args=(
+    data.train_files=data/numina_cot/train.parquet
+    data.val_files=data/math500/test.parquet
+    data.prompt_key=extra_info
+    data.response_key=extra_info
+    data.train_batch_size=256
+    data.max_length=4096
+    optim.lr=$lr
+    "data.prompt_dict_keys=['question']"
+    "data.response_dict_keys=['answer']"
+    data.micro_batch_size_per_gpu=16
+    model.partial_pretrain=$model_name
+    model.use_liger=True
+    model.fsdp_config.model_dtype=bf16
+    trainer.default_local_dir=$save_path
+    trainer.project_name=$project_name
+    "trainer.experiment_name=$experiment_name-$run_timestamp"
+    "trainer.logger=['console','wandb']"
+    trainer.default_hdfs_dir=null
+    trainer.test_freq=10
+    trainer.save_freq=50
+    trainer.total_epochs=1
+    trainer.n_gpus_per_node=$nproc_per_node
+    ulysses_sequence_parallel_size=1
     use_remove_padding=true
+)
 
+run_trainer() {
+    $PYBIN -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
+        -m verl.trainer.fsdp_sft_trainer "$@"
+}
 
-# nohup bash train_sft.sh > train_sft_4096.log 2>&1 &
+get_latest_step() {
+    local latest
+    latest=$(ls -d "$save_path"/global_step_* 2>/dev/null | sort -V | tail -n 1)
+    if [ -n "$latest" ]; then
+        basename "$latest" | sed 's/global_step_//'
+    else
+        echo 0
+    fi
+}
+
+# Chunked training loop
+iteration=0
+while :; do
+    iteration=$((iteration + 1))
+    current_step=$(get_latest_step)
+    target_step=$((current_step + chunk_steps))
+
+    echo "======================================================================"
+    echo "[train_sft] iteration $iteration: step $current_step → $target_step"
+    echo "======================================================================"
+    date
+
+    if [ "$current_step" = "0" ]; then
+        # 첫 chunk: 새로 시작
+        run_trainer "${common_args[@]}" trainer.total_training_steps=$target_step
+    else
+        # 이후 chunk: 가장 최근 checkpoint 에서 resume
+        run_trainer "${common_args[@]}" \
+            trainer.total_training_steps=$target_step \
+            trainer.resume_path=auto
+    fi
+
+    new_step=$(get_latest_step)
+    echo "[train_sft] iteration $iteration: ended at step $new_step (target $target_step)"
+
+    # 진척 없으면(전체 epoch 소진) 종료
+    if [ "$new_step" -le "$current_step" ]; then
+        echo "[train_sft] no progress — all epochs complete, exiting loop"
+        break
+    fi
+
+    # 목표 step 도달 못했으면(학습이 비정상 종료됨) 종료
+    if [ "$new_step" -lt "$target_step" ]; then
+        echo "[train_sft] reached step $new_step < target $target_step — likely epochs exhausted, exiting loop"
+        break
+    fi
+
+    echo "[train_sft] sleeping ${sleep_seconds}s before next chunk..."
+    sleep $sleep_seconds
+done
+
+echo "[train_sft] done — final step $(get_latest_step)"
+date

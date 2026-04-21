@@ -80,7 +80,7 @@ class SFTDataset(Dataset):
             import pandas
 
             while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
-                ls = ls[0]
+                ls = ls.iloc[0] if isinstance(ls, pandas.core.series.Series) else ls[0]
             return ls
 
         dataframes = []

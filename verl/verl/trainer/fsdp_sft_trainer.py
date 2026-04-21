@@ -526,12 +526,118 @@ class FSDPSFTTrainer:
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
+        # Save optimizer / lr_scheduler / step so training can be resumed
+        if fsdp_strategy == "fsdp":
+            from torch.distributed.fsdp import FullOptimStateDictConfig, FullStateDictConfig, StateDictType
+
+            sd_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            opt_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, sd_cfg, opt_cfg):
+                optim_state = FSDP.optim_state_dict(self.fsdp_model, self.optimizer)
+        elif fsdp_strategy == "fsdp2":
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
+
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            optim_state = get_optimizer_state_dict(self.fsdp_model, self.optimizer, options=options)
+
+        if self.device_mesh.get_rank() == 0:
+            torch.save(
+                {
+                    "optimizer": optim_state,
+                    "lr_scheduler": self.lr_scheduler.state_dict(),
+                    "global_step": step,
+                },
+                os.path.join(path, "trainer_state.pt"),
+            )
+
         # Copy to HDFS if configured
         if self.device_mesh.get_rank() == 0 and self.config.trainer.default_hdfs_dir:
             hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
             hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
 
         torch.distributed.barrier()
+
+    @staticmethod
+    def _find_latest_checkpoint(base_dir):
+        """Return the ``global_step_N`` subdirectory of ``base_dir`` with the largest N, or ``None``."""
+        if not base_dir or not os.path.isdir(base_dir):
+            return None
+        best = None
+        for name in os.listdir(base_dir):
+            step = extract_step(name)
+            if step is None:
+                continue
+            full = os.path.join(base_dir, name)
+            if not os.path.isdir(full):
+                continue
+            if best is None or step > best[0]:
+                best = (step, full)
+        return best[1] if best else None
+
+    def load_checkpoint(self, path):
+        """Load model + optimizer + lr_scheduler from ``path``. Returns the global_step to resume from.
+
+        ``path`` is a directory created by :meth:`save_checkpoint` (``global_step_N``). If
+        ``trainer_state.pt`` is missing (e.g. a HF-only checkpoint), only model weights are
+        loaded and the returned step is 0.
+        """
+        fsdp_strategy = self.config.model.strategy
+        rank = self.device_mesh.get_rank()
+
+        # --- model weights ---
+        if rank == 0:
+            tmp_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float32)
+            model_state = tmp_model.state_dict()
+            del tmp_model
+        else:
+            model_state = {}
+
+        if fsdp_strategy == "fsdp":
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+            sd_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, sd_cfg):
+                self.fsdp_model.load_state_dict(model_state if rank == 0 else {}, strict=False)
+        elif fsdp_strategy == "fsdp2":
+            cpu_offload = (
+                CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
+                if self.config.model.fsdp_config.cpu_offload
+                else None
+            )
+            fsdp2_load_full_state_dict(self.fsdp_model, model_state, self.device_mesh, cpu_offload)
+        else:
+            raise NotImplementedError(f"not implement {fsdp_strategy}")
+
+        # --- trainer state (optimizer / lr_scheduler / step) ---
+        trainer_state_path = os.path.join(path, "trainer_state.pt")
+        if not os.path.exists(trainer_state_path):
+            if rank == 0:
+                print(f"[resume] {trainer_state_path} not found; loaded weights only, starting at step 0")
+            torch.distributed.barrier()
+            return 0
+
+        trainer_state = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
+
+        if fsdp_strategy == "fsdp":
+            flat_osd = FSDP.optim_state_dict_to_load(
+                model=self.fsdp_model, optim=self.optimizer, optim_state_dict=trainer_state["optimizer"]
+            )
+            self.optimizer.load_state_dict(flat_osd)
+        elif fsdp_strategy == "fsdp2":
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_optimizer_state_dict
+
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            set_optimizer_state_dict(
+                self.fsdp_model, self.optimizer, trainer_state["optimizer"], options=options
+            )
+
+        self.lr_scheduler.load_state_dict(trainer_state["lr_scheduler"])
+        global_step = int(trainer_state["global_step"])
+
+        if rank == 0:
+            print(f"[resume] loaded checkpoint from {path}, resuming at global_step={global_step}")
+        torch.distributed.barrier()
+        return global_step
 
     def fit(self):
         rank = self.device_mesh.get_rank()
@@ -556,17 +662,32 @@ class FSDPSFTTrainer:
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
 
-        # TODO (zhangchi.usc1992) add back checkpoint manager.
-        # Currently, it blocks when uploading to hdfs. So very slow.
+        resume_path = getattr(self.config.trainer, "resume_path", None)
+        if resume_path == "auto":
+            resume_path = self._find_latest_checkpoint(self.config.trainer.default_local_dir)
+            if rank == 0:
+                if resume_path:
+                    print(f"[resume] auto-detected latest checkpoint: {resume_path}")
+                else:
+                    print(
+                        f"[resume] auto mode: no checkpoint found under "
+                        f"{self.config.trainer.default_local_dir}, starting from scratch"
+                    )
+        if resume_path:
+            global_step = self.load_checkpoint(resume_path)
+        start_epoch = global_step // self.steps_per_epoch
+        skip_batches = global_step % self.steps_per_epoch
 
-        for epoch in range(self.config.trainer.total_epochs):
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
-            for data in tqdm(
+            for i, data in enumerate(tqdm(
                 self.train_dataloader,
                 total=self.steps_per_epoch,
                 desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
                 disable=rank != 0,
-            ):
+            )):
+                if epoch == start_epoch and i < skip_batches:
+                    continue
                 global_step += 1
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
                 metric = self.training_step(data)

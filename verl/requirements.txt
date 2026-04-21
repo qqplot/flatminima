@@ -1,9 +1,19 @@
-# requirements.txt records the full set of dependencies for development
+# requirements.txt — runtime dependencies for verl on ROCm torch
+#
+# Safe install on an existing rocm-torch environment:
+#   pip install -r requirements.txt -c constraints-rocm.txt \
+#       --upgrade-strategy only-if-needed
+#
+# The constraints file pins torch and every already-installed package to the
+# current version, so pip can only add missing packages — it cannot upgrade
+# or replace the ROCm torch wheel, flash-attn, numpy, transformers, etc.
+
 accelerate
 codetiming
 datasets
 dill
-flash-attn
+# flash-attn  — already installed as a ROCm-compatible build (flash-attn 2.8.3).
+#               Re-installing from pip would try to build a CUDA wheel. Skip.
 hydra-core
 liger-kernel
 numpy
@@ -12,9 +22,9 @@ peft
 pyarrow>=19.0.0
 pybind11
 pylatexenc
-pre-commit
+# pre-commit  — dev-only tool, not needed to run training.
 ray[default]
-tensordict<=0.6.2
+tensordict            # upstream pinned <=0.6.2; too old for torch 2.9, use latest.
 torchdata
 transformers
 # vllm==0.8.4
