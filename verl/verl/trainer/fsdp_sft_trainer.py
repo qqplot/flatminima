@@ -611,10 +611,16 @@ class FSDPSFTTrainer:
         # --- trainer state (optimizer / lr_scheduler / step) ---
         trainer_state_path = os.path.join(path, "trainer_state.pt")
         if not os.path.exists(trainer_state_path):
+            # Legacy checkpoint (weights only). Recover step counter from directory name so the
+            # loop doesn't restart from 0; optimizer + lr_scheduler remain at their init state.
+            fallback_step = extract_step(os.path.basename(os.path.normpath(path))) or 0
             if rank == 0:
-                print(f"[resume] {trainer_state_path} not found; loaded weights only, starting at step 0")
+                print(
+                    f"[resume] {trainer_state_path} not found; weights loaded but optimizer/lr_scheduler "
+                    f"could not be restored — resuming at step {fallback_step} (from dir name)"
+                )
             torch.distributed.barrier()
-            return 0
+            return fallback_step
 
         trainer_state = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
 
@@ -677,6 +683,12 @@ class FSDPSFTTrainer:
             global_step = self.load_checkpoint(resume_path)
         start_epoch = global_step // self.steps_per_epoch
         skip_batches = global_step % self.steps_per_epoch
+        if rank == 0 and global_step > 0:
+            print(
+                f"[resume] global_step={global_step} / total={self.total_training_steps} | "
+                f"start at epoch {start_epoch + 1}/{self.config.trainer.total_epochs}, "
+                f"batch {skip_batches + 1}/{self.steps_per_epoch}"
+            )
 
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -697,6 +709,8 @@ class FSDPSFTTrainer:
                 is_last_step = global_step >= self.total_training_steps
                 is_valid_step = global_step % self.config.trainer.test_freq == 0
                 is_save_step = global_step % self.config.trainer.save_freq == 0
+                # Epoch 마지막 step 에서도 checkpoint 를 남겨 epoch 경계 resume 을 보장
+                is_epoch_end = (i + 1) == self.steps_per_epoch
 
                 # early exit or validation step
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
@@ -715,7 +729,7 @@ class FSDPSFTTrainer:
                         last_valid_metric = metric
                     torch.distributed.barrier()
 
-                if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
+                if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step) or is_epoch_end:
                     self.save_checkpoint(step=global_step)
 
                 if is_last_step:

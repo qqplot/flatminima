@@ -43,9 +43,27 @@ save_path=checkpoints/$experiment_name
 lr=5e-5
 
 # Chunked training 설정: 100 step 마다 종료하고 15분 sleep 후 resume 반복.
-chunk_steps=${CHUNK_STEPS:-100}          # 한 번에 학습할 step 수
+chunk_steps=${CHUNK_STEPS:-200}          # 한 번에 학습할 step 수
 sleep_seconds=${SLEEP_SECONDS:-900}      # 15분
 run_timestamp=$(date +%Y%m%d-%H%M%S)     # phase 전체가 같은 experiment_name 공유
+
+# 모든 chunk 가 같은 wandb run 에 기록되도록 run_id 고정 (점/공백 등은 하이픈으로 치환).
+# - $save_path/wandb_run_id.txt 가 있으면 그대로 재사용 (cross-invocation 이어쓰기)
+# - 없으면 새 run_id 를 만들어 파일에 기록 (다음 호출부터 재사용 가능)
+# WANDB_RESUME=allow 는 동일 ID 의 run 이 있으면 이어쓰고 없으면 새로 생성.
+wandb_id_file="$save_path/wandb_run_id.txt"
+mkdir -p "$save_path"
+if [ -s "$wandb_id_file" ]; then
+    export WANDB_RUN_ID="$(cat "$wandb_id_file")"
+    echo "[train_sft] reusing existing wandb run id from $wandb_id_file"
+else
+    sanitized_name="${experiment_name//[. ]/-}"
+    export WANDB_RUN_ID="${sanitized_name}-${run_timestamp}"
+    echo "$WANDB_RUN_ID" > "$wandb_id_file"
+    echo "[train_sft] created new wandb run id, saved to $wandb_id_file"
+fi
+export WANDB_RESUME=allow
+echo "[train_sft] WANDB_RUN_ID=$WANDB_RUN_ID (resume=$WANDB_RESUME)"
 
 # 두 phase 공통 인자 (단일 source of truth)
 common_args=(
@@ -69,7 +87,7 @@ common_args=(
     trainer.default_hdfs_dir=null
     trainer.test_freq=10
     trainer.save_freq=50
-    trainer.total_epochs=1
+    trainer.total_epochs=3
     trainer.n_gpus_per_node=$nproc_per_node
     ulysses_sequence_parallel_size=1
     use_remove_padding=true
