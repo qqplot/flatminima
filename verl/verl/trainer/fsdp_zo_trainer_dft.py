@@ -301,10 +301,11 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
+        # betas must be a plain tuple; OmegaConf ListConfig breaks torch.distributed.checkpoint.
         self.optimizer = optim.AdamW(
             self.fsdp_model.parameters(),
             lr=self.config.optim.lr,
-            betas=self.config.optim.betas,
+            betas=tuple(self.config.optim.betas),
             weight_decay=self.config.optim.weight_decay,
         )
 
@@ -641,6 +642,13 @@ class FSDPSFTTrainer:
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
+        from verl.trainer._sft_resume_utils import save_trainer_state
+
+        save_trainer_state(
+            self.fsdp_model, self.optimizer, self.lr_scheduler,
+            step, path, fsdp_strategy, self.device_mesh.get_rank(),
+        )
+
         # Copy to HDFS if configured
         if self.device_mesh.get_rank() == 0 and self.config.trainer.default_hdfs_dir:
             hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
@@ -671,17 +679,37 @@ class FSDPSFTTrainer:
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
 
-        # TODO (zhangchi.usc1992) add back checkpoint manager.
-        # Currently, it blocks when uploading to hdfs. So very slow.
+        from verl.trainer._sft_resume_utils import load_trainer_state, resolve_resume_path
 
-        for epoch in range(self.config.trainer.total_epochs):
+        resume_path = resolve_resume_path(
+            getattr(self.config.trainer, "resume_path", None),
+            self.config.trainer.default_local_dir,
+            rank,
+        )
+        if resume_path:
+            global_step = load_trainer_state(
+                self.fsdp_model, self.optimizer, self.lr_scheduler,
+                resume_path, self.config.model.strategy, self.device_mesh,
+            )
+        start_epoch = global_step // self.steps_per_epoch
+        skip_batches = global_step % self.steps_per_epoch
+        if rank == 0 and global_step > 0:
+            print(
+                f"[resume] global_step={global_step} / total={self.total_training_steps} | "
+                f"start at epoch {start_epoch + 1}/{self.config.trainer.total_epochs}, "
+                f"batch {skip_batches + 1}/{self.steps_per_epoch}"
+            )
+
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
-            for data in tqdm(
+            for i, data in enumerate(tqdm(
                 self.train_dataloader,
                 total=self.steps_per_epoch,
                 desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
                 disable=rank != 0,
-            ):
+            )):
+                if epoch == start_epoch and i < skip_batches:
+                    continue
                 global_step += 1
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
                 # metric = self.training_step(data)
@@ -693,6 +721,7 @@ class FSDPSFTTrainer:
                 is_last_step = global_step >= self.total_training_steps
                 is_valid_step = global_step % self.config.trainer.test_freq == 0
                 is_save_step = global_step % self.config.trainer.save_freq == 0
+                is_epoch_end = (i + 1) == self.steps_per_epoch
 
                 # early exit or validation step
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
@@ -711,7 +740,7 @@ class FSDPSFTTrainer:
                         last_valid_metric = metric
                     torch.distributed.barrier()
 
-                if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
+                if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step) or is_epoch_end:
                     self.save_checkpoint(step=global_step)
 
                 if is_last_step:

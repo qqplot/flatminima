@@ -5,6 +5,15 @@ verl/tensorboard_log
 verl/wandb
 verl/checkpoints
 
+# training run artifacts: stdout/stderr .out files, pid/lock/marker files,
+# master run_all logs, per-method exp logs, monitor samples.
+# (monitors/ 스크립트는 commit 대상이지만 logs/ 는 세션별 결과이므로 제외)
+verl/logs/
+
+# local Claude Code / IDE 설정
+.claude/
+verl/.claude/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

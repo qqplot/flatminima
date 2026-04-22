@@ -301,10 +301,12 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
+        # NOTE: betas must be a plain tuple; OmegaConf ListConfig breaks
+        # torch.distributed.checkpoint.state_dict.get_optimizer_state_dict.
         self.optimizer = optim.AdamW(
             self.fsdp_model.parameters(),
             lr=self.config.optim.lr,
-            betas=self.config.optim.betas,
+            betas=tuple(self.config.optim.betas),
             weight_decay=self.config.optim.weight_decay,
         )
 

@@ -48,15 +48,21 @@ sleep_seconds=${SLEEP_SECONDS:-900}      # 15분
 run_timestamp=$(date +%Y%m%d-%H%M%S)     # phase 전체가 같은 experiment_name 공유
 
 # 모든 chunk 가 같은 wandb run 에 기록되도록 run_id 고정 (점/공백 등은 하이픈으로 치환).
-# - $save_path/wandb_run_id.txt 가 있으면 그대로 재사용 (cross-invocation 이어쓰기)
-# - 없으면 새 run_id 를 만들어 파일에 기록 (다음 호출부터 재사용 가능)
-# WANDB_RESUME=allow 는 동일 ID 의 run 이 있으면 이어쓰고 없으면 새로 생성.
+# 규칙:
+#   - checkpoint 가 하나라도 있으면 기존 wandb_run_id.txt 를 재사용 (resume)
+#   - checkpoint 가 없는데 id 파일만 있으면 이전 run 이 crash/abort 한 상태 → 새 id 재발급
+#   - 아예 처음이면 새 id 생성
+# WANDB_RESUME=allow: 동일 ID run 있으면 이어쓰기, 없으면 새로 생성.
 wandb_id_file="$save_path/wandb_run_id.txt"
 mkdir -p "$save_path"
-if [ -s "$wandb_id_file" ]; then
+has_ckpt=$(ls -d "$save_path"/global_step_* 2>/dev/null | head -n 1)
+if [ -s "$wandb_id_file" ] && [ -n "$has_ckpt" ]; then
     export WANDB_RUN_ID="$(cat "$wandb_id_file")"
-    echo "[train_sft] reusing existing wandb run id from $wandb_id_file"
+    echo "[train_sft] reusing existing wandb run id from $wandb_id_file (checkpoints present)"
 else
+    if [ -s "$wandb_id_file" ] && [ -z "$has_ckpt" ]; then
+        echo "[train_sft] stale wandb_run_id.txt with no checkpoints → regenerating new run id"
+    fi
     sanitized_name="${experiment_name//[. ]/-}"
     export WANDB_RUN_ID="${sanitized_name}-${run_timestamp}"
     echo "$WANDB_RUN_ID" > "$wandb_id_file"
