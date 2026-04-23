@@ -90,8 +90,30 @@ pip install --no-deps -e .
 ### Step 1: Prepare Data
 
 ```bash
-# Generate training data (optional: change --train_end to control volume)
+
+# Train Datasets
+## 1. Numina: Generate training data (optional: change --train_end to control volume)
 python examples/data_preprocess/numina_cot.py --train_end 100000
+
+## 2. AIME
+python examples/data_preprocess/multipath.py --max_char_len 30000
+
+# 📊 --- 데이터셋 필터링 및 길이 통계 ---
+# 원본 데이터 총 개수: 7,930 개
+# 제거된 데이터 개수: 1,676 개 (21.13%)
+# 최종 남은 데이터 개수: 6,254 개
+# ----------------------------------------
+# 유니크한 질문(문제) 개수: 793 개
+# 질문당 평균 답변 수: 7.89 개
+# ----------------------------------------
+# [필터링 후] 최대 길이: 30,000 자
+# [필터링 후] 최소 길이: 138 자
+# [필터링 후] 평균 길이: 11,908.45 자
+# ---------------------------------------
+
+## 3. OpenThought (처음 데이터셋 용량 꽤 듦)
+python examples/data_preprocess/openthought_cot_filtered.py --max_length 8192 --num_samples 3000
+
 
 # Generate evaluation data
 python examples/data_preprocess/math_dataset.py
