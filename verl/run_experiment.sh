@@ -93,8 +93,8 @@ micro_bs=${MICRO_BS_PER_GPU:-16}
 nproc_per_node=${NPROC_PER_NODE:-8}
 chunk_steps=${CHUNK_STEPS:-100}
 sleep_seconds=${SLEEP_SECONDS:-900}
-save_freq=${SAVE_FREQ:-100}
-test_freq=${TEST_FREQ:-50}
+save_freq=${SAVE_FREQ:-50}
+test_freq=${TEST_FREQ:-10}
 # chunk 사이 rolling prune: 최신 K개만 유지 (resume 안전성 ↔ 디스크 균형).
 # K<=0 이면 비활성. AUTO_PRUNE(종료 후 epoch 경계만 유지)과 독립으로 동작.
 keep_recent=${KEEP_RECENT_CKPTS:-2}
@@ -108,7 +108,10 @@ data_val=${DATA_VAL:-data/math500/test.parquet}
 method_slug=${METHOD//+/-}
 model_slug=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]' | tr '/' '-' | tr '.' '-')
 experiment_name=${EXPERIMENT_NAME:-"${project_name}-${method_slug}-${model_slug}"}
-save_path="checkpoints/$experiment_name"
+# CKPT_BASE_DIR 지정 시 절대경로(/data1 NVMe)로, 미지정 시 cwd 기반(레거시).
+ckpt_base_dir=${CKPT_BASE_DIR:-.}
+mkdir -p "$ckpt_base_dir/checkpoints"
+save_path="$ckpt_base_dir/checkpoints/$experiment_name"
 run_timestamp=$(date +%Y%m%d-%H%M%S)
 
 # ---------- 환경변수 (train_sft.sh 와 동일) ----------
@@ -164,6 +167,7 @@ common_args=(
     "model.partial_pretrain=$MODEL_NAME"
     model.use_liger=True
     model.fsdp_config.model_dtype=bf16
+    "model.strategy=${MODEL_STRATEGY:-fsdp}"
     "trainer.default_local_dir=$save_path"
     "trainer.project_name=$project_name"
     "trainer.experiment_name=${experiment_name}-${run_timestamp}"
@@ -295,6 +299,10 @@ while :; do
     fi
 
     rolling_prune
+    # GPU/NCCL context 가 fully cleanup될 시간 추가 — destroy_process_group 누락 회피용
+    echo "[run_experiment] post-chunk cooldown: sync + sleep 30 (ROCm driver cleanup)"
+    sync
+    sleep 30
     echo "[run_experiment] sleeping ${sleep_seconds}s before next chunk..."
     sleep "$sleep_seconds"
 done
@@ -306,4 +314,15 @@ date
 if [ "${AUTO_PRUNE:-false}" = "true" ]; then
     echo "[run_experiment] AUTO_PRUNE=true — pruning intermediate checkpoints..."
     bash "$(dirname "$0")/prune_epoch_ckpt.sh" "$save_path" --apply --epochs "$total_epochs"
+fi
+
+# BACKUP_AND_PURGE=true 면 method 의 ckpt 디렉터리 전체를 원격 저장소로 rsync 백업한 후
+# 로컬을 비움. REMOTE_HOST / REMOTE_BASE_PATH env 가 같이 지정되어야 함.
+if [ "${BACKUP_AND_PURGE:-false}" = "true" ]; then
+    echo "[run_experiment] BACKUP_AND_PURGE=true — backup_method.sh 호출"
+    bash "$(dirname "$0")/monitors/backup_method.sh" "$save_path"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "[run_experiment] WARN: backup_method.sh exit=$rc — local 유지됨, 다음 method 디스크 압박 가능" >&2
+    fi
 fi

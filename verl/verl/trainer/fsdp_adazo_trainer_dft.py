@@ -525,11 +525,11 @@ class FSDPSFTTrainer:
     #             set_model_state_dict(self.fsdp_model, state, options=options)
     #     else:
     #         from torch.distributed.fsdp import StateDictType
-    #         with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
+    #         with FSDP.state_dict_type(self.fsdp_model, StateDictType.SHARDED_STATE_DICT):
     #             orig_state = {k: v.clone() for k, v in self.fsdp_model.state_dict().items()}
                 
     #         def apply_state(state):
-    #             with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
+    #             with FSDP.state_dict_type(self.fsdp_model, StateDictType.SHARDED_STATE_DICT):
     #                 self.fsdp_model.load_state_dict(state, strict=False)
 
     #     # 업데이트가 필요한(requires_grad) 파라미터 이름만 추출
@@ -729,7 +729,7 @@ class FSDPSFTTrainer:
             raw_state = get_model_state_dict(self.fsdp_model, options=options)
         else:
             from torch.distributed.fsdp import StateDictType
-            with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.SHARDED_STATE_DICT):
                 raw_state = self.fsdp_model.state_dict()
                 
         # 로컬 Shard 파라미터 복사 (GPU당 약 700MB 수준이므로 OOM 걱정 없음)
@@ -740,7 +740,7 @@ class FSDPSFTTrainer:
             if is_fsdp2:
                 set_model_state_dict(self.fsdp_model, state_dict, options=options)
             else:
-                with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
+                with FSDP.state_dict_type(self.fsdp_model, StateDictType.SHARDED_STATE_DICT):
                     self.fsdp_model.load_state_dict(state_dict, strict=False)
 
         dp_size = self.device_mesh.size(0)
@@ -1040,18 +1040,23 @@ def run_sft(config):
     train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
     val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
-    trainer = FSDPSFTTrainer(
-        config=config,
-        device_mesh=device_mesh,
-        ulysses_device_mesh=ulysses_device_mesh,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-    )
-
-    trainer.fit()
-
-    destroy_global_process_group()
+    # ROCm + FSDP2 환경에서 ckpt restore broadcast 중 'invalid device pointer' NCCL 에러 발생 시
+    # destroy_global_process_group()이 호출되지 않아 다음 iter init이 leaked context로 실패하는 문제 방지
+    try:
+        trainer = FSDPSFTTrainer(
+            config=config,
+            device_mesh=device_mesh,
+            ulysses_device_mesh=ulysses_device_mesh,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+        )
+        trainer.fit()
+    finally:
+        try:
+            destroy_global_process_group()
+        except Exception as e:
+            print(f"[warn] destroy_global_process_group failed: {e}")
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)

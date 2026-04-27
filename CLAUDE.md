@@ -88,13 +88,34 @@ WANDB_MODE=offline METHOD=sft+adazo MODEL_NAME="Qwen/Qwen2.5-1.5B-Instruct" \
 
 ---
 
-## 현재 진행 중 (요약)
+## 현재 진행 중 (2026-04-27 기준 · `EXPERIMENT_STATUS.md`는 04-22로 stale)
 
-자세한 내용은 `EXPERIMENT_STATUS.md` Section 5 참고.
+### 전체 상태
+- **모든 훈련/데몬 정지**. 마지막 활동 04-26 00:12 (모니터 로그 멈춤).
+- 6 method 중 **2개 완료**: sft (04-22, 원격 백업+purge), sft+adazo (04-25 17:40, val_loss 0.700).
+- **sft+adazo 백업 실패**: 04-25T17:40 SSH `kex_exchange_identification: read: Connection reset by peer` → 28G ckpt가 `/data/flatminima/verl/checkpoints/numina-cot-sft-adazo-qwen-qwen2-5-1-5b-instruct/`에 그대로 남음 (preserved=[390,780], live=[1170]).
+- 남은 4 method: **sft+zo → dft → dft+adazo → dft+zo** (이 순서로 `run_all_experiments.sh`의 experiments 배열, sft+adazo는 주석 처리됨).
 
-- **METHOD=sft** 진행 중 (iter 2-3 전환 구간, ~90% 완료 예상)
-- 사용자 요청: **sft 3-epoch 완주 후 자동 pause** (sft+adazo 시작 전) → `pause_after_sft.sh` 감시 중
-- 다음 단계 결정 대기: pause 후 sft+adazo를 이어서 돌릴지, 아니면 먼저 결과 확인 후 재개할지
+### NVMe 마이그레이션 계획 (검토 완료, 미적용)
+- 새 7T NVMe 3개 마운트됨: `/data1`, `/data2`, `/data3` (각 6.6T 여유).
+- 합의된 설계:
+  - **save_path**: `/data1/flatminima/verl/checkpoints/...`
+  - **백업**: `/data2/flatminima/backup/...` (cross-disk local rsync — 원격 SSH 의존성 제거)
+  - **로그**: `/data/flatminima/verl/logs/` 유지 (PID 호환성)
+  - `BACKUP_AND_PURGE=true → false` (NVMe 여유로 method별 ckpt 모두 보존)
+  - `disk_monitor.sh` `FLAT_MAX_GB`: 90 → 6000, `CKPT_ROOT`/`FLAT_ROOT`도 `/data1`로
+- 디렉토리만 생성됨: `/data1/flatminima/verl/checkpoints`, `/data2/flatminima/backup`. 스크립트 수정은 미적용.
+- 영향 받는 파일 4개: `run_all_experiments.sh`, `run_experiment.sh`, `monitors/backup_method.sh`, `monitors/disk_monitor.sh`.
+
+### 미결정 항목
+1. **기존 28G sft+adazo ckpt 처리** (a) `/data1`로 mv 후 백업 / (b) 그대로 두고 새 method만 NVMe.
+2. **SAM 메트릭 0 조사**: sft+adazo wandb에서 `sam/eps_scale`, `sam/g_proj`, `sam/norm_z` 전부 0 — AdaZO ramp 미활성 의심. dft+adazo 시작 전 확인 권장.
+3. **데몬 재시작 시점**: config 적용 후.
+
+### 남은 실험 wall-clock 예상 (실측 기반)
+- 기준: sft 4.5h, sft+adazo 11.5h
+- sft+zo 6–8h, dft 5–6h, dft+adazo 11–13h, dft+zo 7–9h
+- **합계 29–36h**, 운영 오버헤드(NCCL transient/chunk sleep) 포함 시 **36–44h (1.5–2일)**
 
 ---
 
@@ -102,5 +123,6 @@ WANDB_MODE=offline METHOD=sft+adazo MODEL_NAME="Qwen/Qwen2.5-1.5B-Instruct" \
 
 - `run_all_experiments.sh`의 `experiments` 배열을 중간에 편집하지 말 것 (이미 실행 중인 bash에는 반영 안 됨).
 - `WANDB_MODE=online` 강제하지 말 것 (키 없어서 즉사).
-- `/data` 어디에나 mount된 볼륨은 같은 295G 한 볼륨이라 공간 공유. 아무데나 체크포인트 저장하지 말 것.
+- 마운트별 공간 차이 주의: **`/data`는 LVM 295G(공유), `/data1/2/3`은 각 7T NVMe(독립)**. 새 워크로드는 NVMe 우선.
 - 기존 `preserved/` 디렉터리 건드리지 말 것 — 사용자가 명시 보존한 step들.
+- 원격 SSH 백업(`kyubyungchae@147.47.200.22`)은 04-25 실패 사례 있음 — 새 작업은 local cross-disk 백업 우선.

@@ -450,6 +450,15 @@ class FSDPSFTTrainer:
         # =================================================================
         # 순수 Zeroth-Order (ZO) Optimization (논문 Algorithm 1)
         # =================================================================
+        # HOLISTIC FIX (2026-04-27): 기존 코드는 백업을 `state_dict()` (FSDP1 SHARDED_STATE_DICT
+        # → unflat 키 `model.layers...`) 으로, grad 마스크와 마지막 grad 할당 루프는
+        # `named_parameters()` (FSDP1 wrapper 키 `_fsdp_wrapped_module._flat_param`) 로
+        # 사용하여 두 키 공간이 일치하지 않았다. 이로 인해:
+        #   - apply_noise 의 `if k in grad_keys` 가 항상 False → ZO 노이즈 silently no-op
+        #   - 마지막 grad 루프의 `orig_state[k]` / `self.model.get_parameter(k)` 는 KeyError/AttributeError
+        # 해결: 백업/주입/복원/grad 할당 모두 `named_parameters()` 키 공간으로 통일.
+        # FSDP1 _flat_param 은 항상 sharded 이므로 numel 기반 sharded 판정 휴리스틱은 불필요.
+        # =================================================================
         self.fsdp_model.train()
         self.optimizer.zero_grad()
 
@@ -460,52 +469,44 @@ class FSDPSFTTrainer:
         global_seed = step
         local_seed = step + rank * 100000
 
-        # --- 상태 백업 (원본 가중치 유지) ---
-        if self.config.model.strategy == "fsdp2":
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
-            options = StateDictOptions(full_state_dict=False, cpu_offload=False)
-            orig_state = get_model_state_dict(self.fsdp_model, options=options)
-            orig_state = {k: v.clone() for k, v in orig_state.items()}
-            
-            def apply_state(state):
-                set_model_state_dict(self.fsdp_model, state, options=options)
-        else:
-            from torch.distributed.fsdp import StateDictType
-            with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
-                orig_state = {k: v.clone() for k, v in self.fsdp_model.state_dict().items()}
-                
-            def apply_state(state):
-                with FSDP.state_dict_type(self.fsdp_model, StateDictType.LOCAL_STATE_DICT):
-                    self.fsdp_model.load_state_dict(state, strict=False)
+        # --- 상태 백업: named_parameters().data 로 직접 백업 (FSDP1/2 키 공간 통일) ---
+        orig_state = {
+            k: p.data.clone()
+            for k, p in self.fsdp_model.named_parameters()
+            if p.requires_grad
+        }
+        grad_keys = set(orig_state.keys())
 
-        grad_keys = {k for k, p in self.fsdp_model.named_parameters() if p.requires_grad}
+        def apply_state(state):
+            """state 는 named_parameters 키 공간 dict."""
+            for k, p in self.fsdp_model.named_parameters():
+                if p.requires_grad and k in state:
+                    p.data.copy_(state[k])
+
+        def _is_sharded(v):
+            """FSDP2 DTensor 면 Replicate 여부로 판정, 그 외 (FSDP1 _flat_param 포함) 는 sharded."""
+            if hasattr(v, "placements"):
+                from torch.distributed._tensor.placement_types import Replicate
+                return not all(isinstance(pp, Replicate) for pp in v.placements)
+            return True
 
         # --- 노이즈 주입 함수 ---
         def apply_noise(alpha, current_local_seed):
             noisy_state = {}
-            for k, v in orig_state.items():
-                if k in grad_keys:
-                    is_sharded = True
-                    if hasattr(v, "placements"):
-                        from torch.distributed._tensor.placement_types import Replicate
-                        if all(isinstance(p, Replicate) for p in v.placements):
-                            is_sharded = False
-                    elif getattr(v, "numel", lambda: 0)() == getattr(self.model.get_parameter(k), "numel", lambda: -1)():
-                        is_sharded = False
-                    
-                    seed_to_use = current_local_seed if is_sharded else global_seed
-                    with torch.random.fork_rng(devices=[v.device]):
-                        torch.manual_seed(seed_to_use)
-                        z = torch.randn_like(v)
-                    
-                    noisy_v = v.clone()
-                    if hasattr(noisy_v, "_local_tensor") and hasattr(z, "_local_tensor"):
-                        noisy_v._local_tensor.add_(z._local_tensor, alpha=alpha)
-                    else:
-                        noisy_v.add_(z, alpha=alpha)
-                    noisy_state[k] = noisy_v
+            for k, p in self.fsdp_model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                v = orig_state[k]
+                seed_to_use = current_local_seed if _is_sharded(v) else global_seed
+                with torch.random.fork_rng(devices=[v.device]):
+                    torch.manual_seed(seed_to_use)
+                    z = torch.randn_like(v)
+                noisy_v = v.clone()
+                if hasattr(noisy_v, "_local_tensor") and hasattr(z, "_local_tensor"):
+                    noisy_v._local_tensor.add_(z._local_tensor, alpha=alpha)
                 else:
-                    noisy_state[k] = v.clone()
+                    noisy_v.add_(z, alpha=alpha)
+                noisy_state[k] = noisy_v
             apply_state(noisy_state)
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
@@ -544,32 +545,22 @@ class FSDPSFTTrainer:
 
         # =================================================================
         # 수동으로 p.grad 할당 (FSDP 통신 최소화)
+        # named_parameters 키 공간으로 통일 — orig_state 도 같은 키 공간이라 룩업 안전.
         # =================================================================
         for k, p in self.fsdp_model.named_parameters():
-            if p.requires_grad:
-                v = orig_state[k]
-                is_sharded = True
-                if hasattr(v, "placements"):
-                    from torch.distributed._tensor.placement_types import Replicate
-                    if all(isinstance(p, Replicate) for p in v.placements):
-                        is_sharded = False
-                elif getattr(v, "numel", lambda: 0)() == getattr(self.model.get_parameter(k), "numel", lambda: -1)():
-                    is_sharded = False
-
-                # 위에서 썼던 것과 "정확히 동일한" 노이즈 z를 다시 생성
-                seed_to_use = local_seed if is_sharded else global_seed
-                with torch.random.fork_rng(devices=[v.device]):
-                    torch.manual_seed(seed_to_use)
-                    z = torch.randn_like(v)
-                
-                # p.grad = 스칼라 * z 
-                if p.grad is None:
-                    p.grad = torch.zeros_like(p)
-                
-                if hasattr(p.grad, "_local_tensor") and hasattr(z, "_local_tensor"):
-                    p.grad._local_tensor.copy_(z._local_tensor * projected_grad_scalar)
-                else:
-                    p.grad.copy_(z * projected_grad_scalar)
+            if not p.requires_grad:
+                continue
+            v = orig_state[k]
+            seed_to_use = local_seed if _is_sharded(v) else global_seed
+            with torch.random.fork_rng(devices=[v.device]):
+                torch.manual_seed(seed_to_use)
+                z = torch.randn_like(v)
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            if hasattr(p.grad, "_local_tensor") and hasattr(z, "_local_tensor"):
+                p.grad._local_tensor.copy_(z._local_tensor * projected_grad_scalar)
+            else:
+                p.grad.copy_(z * projected_grad_scalar)
 
         # --- 옵티마이저 업데이트 ---
         if self.config.model.strategy == "fsdp":
@@ -768,18 +759,23 @@ def run_sft(config):
     train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
     val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
-    trainer = FSDPSFTTrainer(
-        config=config,
-        device_mesh=device_mesh,
-        ulysses_device_mesh=ulysses_device_mesh,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-    )
-
-    trainer.fit()
-
-    destroy_global_process_group()
+    # ROCm + FSDP2 환경에서 ckpt restore broadcast 중 'invalid device pointer' NCCL 에러 발생 시
+    # destroy_global_process_group()이 호출되지 않아 다음 iter init이 leaked context로 실패하는 문제 방지
+    try:
+        trainer = FSDPSFTTrainer(
+            config=config,
+            device_mesh=device_mesh,
+            ulysses_device_mesh=ulysses_device_mesh,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+        )
+        trainer.fit()
+    finally:
+        try:
+            destroy_global_process_group()
+        except Exception as e:
+            print(f"[warn] destroy_global_process_group failed: {e}")
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)

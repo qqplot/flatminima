@@ -11,13 +11,15 @@
 set -u
 OUT="${1:-/data/flatminima/verl/logs/disk_monitor.log}"
 INTERVAL="${INTERVAL:-15}"
-CKPT_ROOT="${CKPT_ROOT:-/data/flatminima/verl/checkpoints}"
-WARN_GB="${WARN_GB:-30}"
-CRIT_GB="${CRIT_GB:-12}"
+# NVMe 마이그레이션 후 기본 ckpt 위치는 /data1 (7T NVMe).
+CKPT_ROOT="${CKPT_ROOT:-/data1/flatminima/verl/checkpoints}"
+WARN_GB="${WARN_GB:-200}"
+CRIT_GB="${CRIT_GB:-50}"
 AUTO_ACTION="${AUTO_ACTION:-}"
 KEEP_RECENT="${KEEP_RECENT:-2}"
-FLAT_ROOT="${FLAT_ROOT:-/data/flatminima}"
-FLAT_MAX_GB="${FLAT_MAX_GB:-90}"
+# /data1 NVMe 의 flatminima 사용량을 감시 (이전 /data 90G 한도 → NVMe 6T 한도).
+FLAT_ROOT="${FLAT_ROOT:-/data1/flatminima}"
+FLAT_MAX_GB="${FLAT_MAX_GB:-6000}"
 RUN_ALL_PIDFILE="${RUN_ALL_PIDFILE:-/data/flatminima/verl/logs/run_all_experiments.pid}"
 KILL_GUARD="${KILL_GUARD:-/data/flatminima/verl/logs/disk_monitor.killed}"
 mkdir -p "$(dirname "$OUT")"
